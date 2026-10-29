@@ -1,0 +1,335 @@
+# %% ---------------------------------------------------------------- CELL 1: IMPORTS
+import io, os, glob, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn import datasets
+from sklearn.model_selection import train_test_split, cross_val_score, KFold, StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.naive_bayes import GaussianNB, MultinomialNB
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, roc_auc_score, roc_curve,
+                             precision_score, recall_score, f1_score,
+                             r2_score, mean_squared_error, mean_absolute_error)
+try:
+    from xgboost import XGBClassifier, XGBRegressor
+    HAS_XGB = True
+except ImportError:
+    from sklearn.ensemble import GradientBoostingClassifier as XGBClassifier, GradientBoostingRegressor as XGBRegressor
+    HAS_XGB = False
+warnings.filterwarnings("ignore")
+
+
+# %% ---------------------------------------------------------------- CELL 2: CONFIG (edit only this)
+# STEP 1 - full path of the CSV / Excel file the professor gives you.
+#          Leave it "" to use the task's built-in default dataset (iris, sentences, ...).
+#          Every line must start at the very left - NO space before the name.
+DATA_PATH = r""
+# DATA_PATH = r"/kaggle/input/datasets/sabarishknight/chundataset/ChurnData.xlsx"
+
+# STEP 2 - uncomment ONLY the line(s) the question asks for. Several lines = several runs.
+TASKS = [
+    # "gaussian_nb",        # Gaussian Naive Bayes              default: iris        -> 100.00 %
+    # "nb_imbalanced",      # Gaussian NB, imbalanced data      needs DATA_PATH      -> 99.30 % on creditcard
+    # "multinomial_nb",     # Multinomial NB + TF-IDF on text   default: 20newsgroups -> 87.88 %
+    # "sentiment",          # LR + Multinomial NB on SENTENCES  default: SENTENCES   -> 50 % / 50 %
+    # "logistic",           # Logistic Regression               default: iris
+    # "random_forest",      # Random Forest (test 0.35)         default: iris        -> 98.11 %
+    # "xgboost",            # XGBoost                           default: iris        -> 100.00 %
+    # "rf_xgb_cv",          # RF + XGB + 5-fold CV + importance needs DATA_PATH      -> 78 % / 78 % on churn
+    # "pca_knn",            # Scaler -> PCA(2) -> KNN(5)        default: iris        -> 0.900
+    # "pca_knn_grid",       # + GridSearchCV over PCA & K       default: iris        -> 0.933
+    # "rf_grid",            # GridSearchCV Random Forest        default: iris
+    # "xgb_grid",           # GridSearchCV XGBoost              default: iris
+    # "auto",               # run every model that fits the data and show the best
+]
+
+# STEP 3 (only for "sentiment" without a file) - type/paste sentences and their labels
+SENTENCES = {
+    "text": [" I absolutely love this product, it works perfectly!",
+             "This is the worst purchase I have ever made.",
+             "It's okay, nothing special but does the job.",
+             "Fantastic customer service and beautiful design.",
+             "Horrible quality, it broke on the first day.",
+             "I am highly satisfied with the fast shipping.",
+             "Waste of money. Do not buy this product.",
+             "Pretty good value for the price, I recommend it.",
+             "item arrived late and the product was damaged, very disappointed."],
+    "sentiment": ["positive", "negative", "neutral", "positive", "negative",
+                  "positive", "negative", "positive", "negative"],
+}
+NEW_TEXTS = ["The item arrived broken and late.", "it is an amazing product",
+             "It works incredibly well, love it!", "not worht the money", "looks good"]
+
+# OPTIONAL - leave as None unless the question says otherwise
+TARGET = None        # e.g. "churn"  (None = auto-detect)
+TEST_SIZE = None     # e.g. 0.3      (None = same as the class notebook)
+SHOW_PLOTS = True
+
+
+# %% ---------------------------------------------------------------- CELL 3: ENGINE (do not edit)
+SPECS = {
+    "gaussian_nb":    dict(data="iris", models=["gnb"]),
+    "nb_imbalanced":  dict(data=None, models=["gnb"], target="Class"),
+    "multinomial_nb": dict(data="20newsgroups", models=["mnb"], max_df=0.5),
+    "sentiment":      dict(data="paste", models=["lr", "mnb"], max_df=1.0),
+    "logistic":       dict(data="iris", models=["lr"]),
+    "random_forest":  dict(data="iris", models=["rf"], test=0.35),
+    "xgboost":        dict(data="iris", models=["xgb"]),
+    "rf_xgb_cv":      dict(data=None, models=["rf", "xgb"], strat=True, cv=True, target="churn"),
+    "pca_knn":        dict(data="iris", models=["knn"], strat=True),
+    "pca_knn_grid":   dict(data="iris", models=["knn", "knn_grid"], strat=True),
+    "rf_grid":        dict(data="iris", models=["rf_grid"], strat=True),
+    "xgb_grid":       dict(data="iris", models=["xgb_grid"], strat=True),
+    "auto":           dict(data="iris", models=["gnb", "mnb", "lr", "rf", "xgb", "knn_grid", "rf_grid"]),
+}
+TITLES = dict(gnb="Gaussian Naive Bayes", mnb="Multinomial Naive Bayes", lr="Logistic/Linear Regression",
+              rf="Random Forest", xgb="XGBoost", knn="Pipeline Scaler+PCA+KNN",
+              knn_grid="GridSearch Scaler+PCA+KNN", rf_grid="GridSearch Random Forest", xgb_grid="GridSearch XGBoost")
+HINTS = ["churn", "class", "target", "label", "labels", "sentiment", "category", "y", "outcome",
+         "species", "diagnosis", "survived", "output", "result", "price"]
+
+
+def find_file(p):
+    if os.path.isfile(p):
+        return p
+    for d in [".", "~/Downloads", "~/Desktop", "~/Documents", "/kaggle/input"]:
+        hits = glob.glob(os.path.join(os.path.expanduser(d), "**", os.path.basename(p)), recursive=True)
+        if hits:
+            return hits[0]
+    raise SystemExit(f"File not found: {p}  -> check DATA_PATH")
+
+
+def load(src):
+    if src == "paste":
+        df = pd.DataFrame(SENTENCES) if isinstance(SENTENCES, dict) else pd.read_csv(io.StringIO(SENTENCES.strip()))
+        return df, None
+    if os.path.splitext(src)[1]:
+        path = find_file(src)
+        ext = os.path.splitext(path)[1].lower()
+        df = (pd.read_excel(path) if ext in (".xlsx", ".xls") else
+              pd.read_json(path) if ext == ".json" else pd.read_csv(path, sep=None, engine="python"))
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.loc[:, ~df.columns.str.startswith("Unnamed")], None
+    key = src.lower().replace("load_", "").replace("fetch_", "")
+    fn, kw = getattr(datasets, "load_" + key, None), {}
+    if fn is None:
+        fn, kw = getattr(datasets, "fetch_" + key), {"download_if_missing": False}
+        kw.update({"subset": "all"} if key == "20newsgroups" else {})
+    try:
+        b = fn(**kw)
+    except Exception:
+        raise SystemExit(f"'{src}' is not downloaded on this PC (needs internet once).")
+    if isinstance(b.data, list):
+        df = pd.DataFrame({"text": b.data, "target": b.target})
+    else:
+        cols = [str(c) for c in getattr(b, "feature_names", range(b.data.shape[1]))]
+        df = pd.DataFrame(b.data, columns=cols)
+        df["target"] = np.asarray(b.target) if np.ndim(b.target) == 1 else np.asarray(b.target)[:, 0]
+    names = getattr(b, "target_names", None)
+    return df, (list(names) if names is not None and len(names) == df["target"].nunique() else None)
+
+
+def pick_target(df, hint):
+    for t in [TARGET, hint]:
+        if t and t in df.columns:
+            return t
+    low = {c.lower(): c for c in df.columns}
+    return next((low[h] for h in HINTS if h in low), df.columns[-1])
+
+
+def text_column(df, target):
+    best, best_n = None, 3.99
+    for c in df.columns:
+        if c != target and not pd.api.types.is_numeric_dtype(df[c]):
+            s = df[c].astype(str)
+            n = s.str.split().str.len().mean()
+            if n > best_n and s.nunique() > 0.5 * len(s):
+                best, best_n = c, n
+    return best
+
+
+def is_classification(y):
+    if not pd.api.types.is_numeric_dtype(y) or pd.api.types.is_bool_dtype(y):
+        return True
+    if pd.api.types.is_float_dtype(y) and not np.all(np.mod(y, 1) == 0):
+        return False
+    return y.nunique() <= max(20, 0.05 * len(y)) and y.nunique() < 0.5 * len(y)
+
+
+def prepare(spec):
+    df, labels = load(DATA_PATH.strip() or spec["data"] or "missing")
+    target = pick_target(df, spec.get("target"))
+    print(f"Data shape {df.shape} | target '{target}'\n{df.head()}")
+    df = df.dropna()
+    tcol = text_column(df, target)
+    clf = is_classification(df[target])
+    y = df[target]
+    if clf:
+        le = LabelEncoder()
+        y = pd.Series(le.fit_transform(y if pd.api.types.is_numeric_dtype(y) else y.astype(str)), index=df.index)
+        labels = labels or [str(c) for c in le.classes_]
+        cnt = y.value_counts()
+        print(f"\n{'TEXT' if tcol else 'TABULAR'} classification | classes: "
+              f"{ {str(labels[i]): int(v) for i, v in cnt.items()} }")
+        if cnt.min() / cnt.max() < 0.1:
+            print("!! IMBALANCED -> judge by minority-class precision / recall / F1 and ROC-AUC, not accuracy")
+    else:
+        y = y.astype(float)
+        print(f"\n{'TEXT' if tcol else 'TABULAR'} regression")
+    if tcol:
+        X, feats = df[tcol].astype(str), None
+    else:
+        X = df.drop(columns=[target])
+        for c in X.columns:
+            if not pd.api.types.is_numeric_dtype(X[c]) or pd.api.types.is_bool_dtype(X[c]):
+                X[c] = LabelEncoder().fit_transform(X[c].astype(str))
+        feats = list(X.columns)
+    strat = y if spec.get("strat") and clf and y.value_counts().min() >= 2 else None
+    test = TEST_SIZE or spec.get("test", 0.2)
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test, random_state=42, stratify=strat)
+    vec = None
+    if tcol:
+        md = spec.get("max_df") if DATA_PATH.strip() == "" and "max_df" in spec else (0.5 if len(Xtr) >= 1000 else 1.0)
+        vec = TfidfVectorizer(stop_words="english", lowercase=True, max_df=md)
+        Xtr, Xte = vec.fit_transform(Xtr), vec.transform(Xte)
+    print(f"Train {Xtr.shape[0]} | Test {Xte.shape[0]} | test_size={test} | stratify={strat is not None}")
+    return dict(Xtr=Xtr, Xte=Xte, ytr=ytr, yte=yte, clf=clf, text=bool(tcol), labels=labels, feats=feats,
+                vec=vec, nf=Xtr.shape[1], nc=y.nunique(), n=len(df))
+
+
+def make(key, c):
+    clf, rs = c["clf"], 42
+    if key in ("gnb", "mnb") and not clf: return None
+    if key == "mnb" and not c["text"]: return None
+    if key in ("gnb", "knn", "knn_grid", "rf_grid", "xgb_grid") and c["text"]: return None
+    cv = (StratifiedKFold if clf else KFold)(n_splits=5, shuffle=True, random_state=rs)
+    grid = lambda est, g: GridSearchCV(est, g, cv=cv, scoring="accuracy" if clf else "r2", verbose=0, n_jobs=-1)
+    knn = lambda: Pipeline([("scaler", StandardScaler()), ("pca", PCA(n_components=min(2, c["nf"]))),
+                            ("knn", (KNeighborsClassifier if clf else KNeighborsRegressor)(n_neighbors=5))])
+    def xgb():
+        if not HAS_XGB: return XGBClassifier(random_state=rs) if clf else XGBRegressor(random_state=rs)
+        if not clf: return XGBRegressor(n_estimators=100, learning_rate=0.1, random_state=rs)
+        if c["nc"] > 2: return XGBClassifier(objective="multi:softprob", num_class=c["nc"], random_state=rs, eval_metric="mlogloss")
+        return XGBClassifier(n_estimators=100, learning_rate=0.1, random_state=rs, eval_metric="logloss")
+    rf = RandomForestClassifier if clf else RandomForestRegressor
+    return {"gnb": GaussianNB, "mnb": MultinomialNB, "xgb": xgb, "knn": knn,
+            "lr": lambda: (LogisticRegression() if c["text"] else LogisticRegression(max_iter=1000)) if clf else LinearRegression(),
+            "rf": lambda: rf(n_estimators=100, random_state=rs),
+            "knn_grid": lambda: grid(knn(), {"pca__n_components": sorted({min(2, c["nf"]), min(3, c["nf"])}),
+                                             "knn__n_neighbors": [3, 5, 7]}),
+            "rf_grid": lambda: grid(rf(random_state=rs), {"n_estimators": [100, 200], "max_depth": [None, 5, 10],
+                                                          "min_samples_split": [2, 5]}),
+            "xgb_grid": lambda: grid(xgb(), {"n_estimators": [100, 200], "max_depth": [3, 6],
+                                             "learning_rate": [0.05, 0.1, 0.3]})}[key]()
+
+
+def evaluate(key, m, c, do_cv):
+    print("\n" + "=" * 60 + f"\nMODEL: {TITLES[key]}\n" + "=" * 60)
+    m.fit(c["Xtr"], c["ytr"])
+    p = m.predict(c["Xte"])
+    if hasattr(m, "best_params_"):
+        print(f"Best params: {m.best_params_} | best CV score: {m.best_score_:.4f}")
+    if c["clf"]:
+        s = accuracy_score(c["yte"], p)
+        cls = np.unique(np.concatenate([c["ytr"], c["yte"]]))
+        names = [str(c["labels"][i]) for i in cls]
+        cm = confusion_matrix(c["yte"], p, labels=cls)
+        print(f"Accuracy: {s * 100:.2f}%  (score {s:.3f})\n")
+        print(classification_report(c["yte"], p, labels=cls, target_names=names, zero_division=0))
+        print("Confusion matrix:\n", cm)
+        avg = "binary" if len(cls) == 2 else "macro"
+        pr, rc, f1 = (f(c["yte"], p, average=avg, zero_division=0) for f in (precision_score, recall_score, f1_score))
+        print(f"Precision: {pr:.4f} | Recall: {rc:.4f} | F1: {f1:.4f}  ({avg}"
+              f"{', positive class = ' + names[1] if avg == 'binary' else ''})")
+        if len(cls) == 2:
+            tn, fp, fn, tp = cm.ravel()
+            print(f"TP={tp}  TN={tn}  FP={fp}  FN={fn}  |  Specificity (TN/(TN+FP)) = {tn / max(tn + fp, 1):.4f}")
+        else:
+            spec_ = [(cm.sum() - cm[i].sum() - cm[:, i].sum() + cm[i, i]) / max(cm.sum() - cm[i].sum(), 1)
+                     for i in range(len(cls))]
+            print("Specificity per class: " + ", ".join(f"{n}={v:.4f}" for n, v in zip(names, spec_)))
+        if hasattr(m, "predict_proba") and len(np.unique(c["yte"])) == len(cls):
+            pp = m.predict_proba(c["Xte"])
+            if len(cls) == 2:
+                auc = roc_auc_score(c["yte"], pp[:, 1])
+                print(f"ROC-AUC: {auc:.4f}")
+                if SHOW_PLOTS:
+                    fpr, tpr, _ = roc_curve(c["yte"], pp[:, 1])
+                    plt.figure(figsize=(5, 4)); plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}"); plt.plot([0, 1], [0, 1], "--")
+                    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+                    plt.title(f"{TITLES[key]} ROC curve"); plt.legend(); plt.show()
+            else:
+                print(f"ROC-AUC (one-vs-rest, macro): {roc_auc_score(c['yte'], pp, multi_class='ovr', labels=cls):.4f}")
+        c.setdefault("f1", {})[key] = f1
+        if SHOW_PLOTS and len(cls) <= 25:
+            plt.figure(figsize=(max(5, .6 * len(cls)), max(4, .5 * len(cls))))
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=names, yticklabels=names)
+            plt.title(f"{TITLES[key]} confusion matrix"); plt.xlabel("Predicted"); plt.ylabel("Actual"); plt.show()
+    else:
+        s = r2_score(c["yte"], p)
+        print(f"R2: {s:.4f} | RMSE: {np.sqrt(mean_squared_error(c['yte'], p)):.4f} | MAE: {mean_absolute_error(c['yte'], p):.4f}")
+    if do_cv and not hasattr(m, "best_params_"):
+        sc = cross_val_score(m, c["Xtr"], c["ytr"], cv=KFold(5, shuffle=True, random_state=42),
+                             scoring="accuracy" if c["clf"] else "r2")
+        print(f"\n5-Fold CV scores: {np.round(sc, 5)}\nMean: {sc.mean():.4f} (+/- {sc.std() * 2:.4f})")
+    est = getattr(m, "best_estimator_", m)
+    if c["feats"] and hasattr(est, "feature_importances_"):
+        imp = est.feature_importances_
+        idx = np.argsort(imp)[::-1]
+        print("\nTop 5 important features:")
+        for i in range(min(5, len(idx))):
+            print(f"{i + 1}. {c['feats'][idx[i]]}: {imp[idx[i]]:.4f}")
+        if SHOW_PLOTS:
+            k = min(15, len(idx))
+            plt.figure(figsize=(7, .35 * k + 1.5))
+            plt.barh([c["feats"][i] for i in idx[:k]][::-1], imp[idx[:k]][::-1], color="skyblue")
+            plt.title(f"{TITLES[key]} feature importance"); plt.tight_layout(); plt.show()
+    return s, m
+
+
+def run_task(task):
+    spec = SPECS[task]
+    print("\n" + "#" * 60 + f"\nTASK: {task}  |  data: {DATA_PATH.strip() or spec['data']}\n" + "#" * 60)
+    if not DATA_PATH.strip() and spec["data"] is None:
+        print(f"'{task}' needs a file -> put its path in DATA_PATH"); return {}
+    c = prepare(spec)
+    keys = spec["models"]
+    if task == "auto" and c["n"] > 20000:
+        keys = [k for k in keys if "grid" not in k]
+    res, fit = {}, {}
+    for k in keys:
+        m = make(k, c)
+        if m is None:
+            if task != "auto": print(f"\n{TITLES[k]} skipped: does not fit this data")
+            continue
+        res[k], fit[k] = evaluate(k, m, c, spec.get("cv", False))
+    print("\n" + "=" * 60 + "\nSUMMARY\n" + "=" * 60)
+    for k, s in sorted(res.items(), key=lambda kv: -kv[1]):
+        print(f"{TITLES[k]:30s} " + (f"Accuracy {s * 100:.2f}%  F1 {c['f1'][k]:.4f}" if c["clf"] else f"R2 {s:.4f}"))
+    if c["text"] and c["clf"] and NEW_TEXTS:
+        Xn = c["vec"].transform(NEW_TEXTS)
+        preds = {k: m.predict(Xn) for k, m in fit.items()}
+        print("\nPredictions on NEW_TEXTS:")
+        for i, t in enumerate(NEW_TEXTS):
+            print(f"Text: '{t}'")
+            for k, p in preds.items():
+                print(f"   -> {k.upper()}: {str(c['labels'][p[i]]).upper()}")
+    return fit
+
+
+def run_all():
+    tasks = TASKS or ["auto"]
+    if not TASKS:
+        print("No task uncommented in TASKS -> running 'auto'")
+    return {t: run_task(t) for t in tasks if t in SPECS or print(f"Unknown task '{t}'")}
+
+
+# %% ---------------------------------------------------------------- CELL 4: RUN
+models = run_all()
